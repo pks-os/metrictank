@@ -130,7 +130,6 @@ type MemoryIndex interface {
 	LoadPartition(int32, []schema.MetricDefinition) int
 	UpdateArchiveLastSave(schema.MKey, int32, uint32)
 	add(*idx.Archive)
-	idsByTagQuery(uint32, TagQueryContext) chan schema.MKey
 	PurgeFindCache()
 	ForceInvalidationFindCache()
 }
@@ -290,7 +289,7 @@ func NewUnpartitionedMemoryIdx() *UnpartitionedMemoryIdx {
 	}
 
 	if MetaTagSupport {
-		m.metaTagIdx = newMetaTagIndex(m.IdsByTagQuery)
+		m.metaTagIdx = newMetaTagIndex(m.idsByTagQuery)
 	}
 
 	return m
@@ -737,11 +736,6 @@ func (m *UnpartitionedMemoryIdx) FindByTag(orgId uint32, query tagquery.Query) [
 		return nil
 	}
 
-	queryCtx := NewTagQueryContext(query)
-
-	m.RLock()
-	defer m.RUnlock()
-
 	var metaTagIdx *orgMetaTagIdx
 	if MetaTagSupport {
 		metaTagIdx = m.getOrgMetaTagIndex(orgId)
@@ -750,9 +744,12 @@ func (m *UnpartitionedMemoryIdx) FindByTag(orgId uint32, query tagquery.Query) [
 		}
 	}
 
+	resCh := make(chan schema.MKey, 100)
 	// construct the output slice of idx.Node's such that there is only 1 idx.Node for each path
-	resCh := m.idsByTagQuery(orgId, queryCtx)
+	m.idsByTagQuery(orgId, query, resCh, true)
 
+	m.RLock()
+	defer m.RUnlock()
 	byPath := make(map[string]*idx.Node)
 	for id := range resCh {
 		def, ok := m.defById[id]
@@ -804,13 +801,13 @@ func (m *UnpartitionedMemoryIdx) FindTerms(orgID uint32, tags []string, query ta
 		terms[tag] = make(map[string]uint32)
 	}
 
-	queryCtx := NewTagQueryContext(query)
+	resCh := make(chan schema.MKey, 100)
 
 	m.RLock()
 	defer m.RUnlock()
 
 	// construct the output slice of idx.Node's such that there is only 1 idx.Node for each path
-	resCh := m.idsByTagQuery(orgID, queryCtx)
+	m.idsByTagQuery(orgID, query, resCh, true)
 
 	var totalResults uint32
 	for id := range resCh {
@@ -929,15 +926,11 @@ func (m *UnpartitionedMemoryIdx) TagDetails(orgId uint32, key string, filter *re
 				continue
 			}
 
-			queryCtx := NewTagQueryContext(query)
-			queryCtx.subQuery = true
-
-			m.RLock()
-			resCh := m.idsByTagQuery(orgId, queryCtx)
+			resCh := make(chan schema.MKey, 100)
+			m.idsByTagQuery(orgId, query, resCh, false)
 			for range resCh {
 				res[value]++
 			}
-			m.RUnlock()
 		}
 	}
 
@@ -1007,11 +1000,11 @@ func (m *UnpartitionedMemoryIdx) FindTagsWithQuery(orgId uint32, prefix string, 
 		}
 	}
 
-	queryCtx := NewTagQueryContext(query)
 	resMap := make(map[string]struct{})
 
+	resCh := make(chan schema.MKey, 100)
+	m.idsByTagQuery(orgId, query, resCh, true)
 	m.RLock()
-	resCh := m.idsByTagQuery(orgId, queryCtx)
 	for id := range resCh {
 		def, ok := m.defById[id]
 		if !ok {
@@ -1116,9 +1109,6 @@ func (m *UnpartitionedMemoryIdx) FindTagValuesWithQuery(orgId uint32, tag, prefi
 		}
 	}
 
-	queryCtx := NewTagQueryContext(query)
-	resMap := make(map[string]struct{})
-
 	m.RLock()
 
 	tags, ok := m.tags[orgId]
@@ -1131,7 +1121,9 @@ func (m *UnpartitionedMemoryIdx) FindTagValuesWithQuery(orgId uint32, tag, prefi
 	// if so we can skip the meta tag enrichment
 	_, isMetricTag := tags[tag]
 
-	resCh := m.idsByTagQuery(orgId, queryCtx)
+	resMap := make(map[string]struct{})
+	resCh := make(chan schema.MKey, 100)
+	m.idsByTagQuery(orgId, query, resCh, true)
 	tagPrefix := tag + "=" + prefix
 	for id := range resCh {
 		def, ok := m.defById[id]
@@ -1185,48 +1177,27 @@ func (m *UnpartitionedMemoryIdx) FindTagValuesWithQuery(orgId uint32, tag, prefi
 	return m.finalizeResult(res, limit, false)
 }
 
-func (m *UnpartitionedMemoryIdx) idsByTagQuery(orgId uint32, query TagQueryContext) chan schema.MKey {
-	resCh := make(chan schema.MKey, 100)
-
-	tags, ok := m.tags[orgId]
-	if !ok {
-		close(resCh)
-		return resCh
-	}
-
-	if MetaTagSupport {
-		metaTagIdx := m.getOrgMetaTagIndex(orgId)
-		query.RunNonBlocking(tags, m.defById, metaTagIdx.tags, metaTagIdx.records, resCh)
-	} else {
-		query.RunNonBlocking(tags, m.defById, nil, nil, resCh)
-	}
-	return resCh
-}
-
-func (m *UnpartitionedMemoryIdx) IdsByTagQuery(orgId uint32, query tagquery.Query, callback func(chan schema.MKey)) {
+func (m *UnpartitionedMemoryIdx) idsByTagQuery(orgId uint32, query tagquery.Query, idCh chan schema.MKey, useMeta bool) {
 	queryCtx := NewTagQueryContext(query)
 
 	m.RLock()
 
-	resCh := make(chan schema.MKey, 100)
-	callback(resCh)
-
 	tags, ok := m.tags[orgId]
 	if !ok {
 		m.RUnlock()
-		close(resCh)
+		close(idCh)
 		return
 	}
 
 	go func() {
-		if MetaTagSupport {
+		if useMeta && MetaTagSupport {
 			metaTagIdx := m.getOrgMetaTagIndex(orgId)
-			queryCtx.RunBlocking(tags, m.defById, metaTagIdx.tags, metaTagIdx.records, resCh)
+			queryCtx.Run(tags, m.defById, metaTagIdx.tags, metaTagIdx.records, idCh)
 		} else {
-			queryCtx.RunBlocking(tags, m.defById, nil, nil, resCh)
+			queryCtx.Run(tags, m.defById, nil, nil, idCh)
 		}
 		m.RUnlock()
-		close(resCh)
+		close(idCh)
 	}()
 }
 
@@ -1461,16 +1432,12 @@ func (m *UnpartitionedMemoryIdx) DeleteTagged(orgId uint32, query tagquery.Query
 		return nil
 	}
 
-	queryCtx := NewTagQueryContext(query)
-
-	m.RLock()
-	resCh := m.idsByTagQuery(orgId, queryCtx)
+	resCh := make(chan schema.MKey, 100)
+	m.idsByTagQuery(orgId, query, resCh, false)
 	ids := make(IdSet)
 	for id := range resCh {
 		ids[id] = struct{}{}
 	}
-
-	m.RUnlock()
 
 	m.Lock()
 	defer m.Unlock()
